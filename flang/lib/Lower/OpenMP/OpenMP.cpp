@@ -2901,6 +2901,47 @@ genFlushOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
                                     operandRange);
 }
 
+/// Pair each privatized allocatable LINEAR item with its linear operand.
+static llvm::SmallVector<std::pair<const semantics::Symbol *, mlir::Value>>
+getLinearAllocatables(
+    llvm::ArrayRef<std::pair<mlir::omp::BlockArgOpenMPOpInterface,
+                             const ObjectEntryBlockArgs &>>
+        wrapperArgs) {
+  llvm::SmallVector<mlir::Value> linearVars;
+  for (auto [argGeneratingOp, blockArgs] : wrapperArgs) {
+    mlir::Operation *wrapperOp = argGeneratingOp.getOperation();
+    if (auto simdOp = mlir::dyn_cast<mlir::omp::SimdOp>(wrapperOp))
+      llvm::append_range(linearVars, simdOp.getLinearVars());
+    else if (auto wsloopOp = mlir::dyn_cast<mlir::omp::WsloopOp>(wrapperOp))
+      llvm::append_range(linearVars, wsloopOp.getLinearVars());
+  }
+
+  llvm::SmallVector<std::pair<const semantics::Symbol *, mlir::Value>> result;
+  if (linearVars.empty())
+    return result;
+
+  for (auto [argGeneratingOp, blockArgs] : wrapperArgs) {
+    for (auto [object, privVar] :
+         llvm::zip_equal(blockArgs.priv.objects, blockArgs.priv.vars)) {
+      const semantics::Symbol *sym = object.sym();
+      if (!sym->test(semantics::Symbol::Flag::OmpLinear) ||
+          !semantics::IsAllocatable(sym->GetUltimate()))
+        continue;
+      // The linear operand is box_addr(load(original descriptor)).
+      mlir::Value origVar = privVar;
+      auto *linearVar = llvm::find_if(linearVars, [&](mlir::Value var) {
+        auto boxAddr = var.getDefiningOp<fir::BoxAddrOp>();
+        auto load =
+            boxAddr ? boxAddr.getVal().getDefiningOp<fir::LoadOp>() : nullptr;
+        return load && load.getMemref() == origVar;
+      });
+      if (linearVar != linearVars.end())
+        result.emplace_back(sym, *linearVar);
+    }
+  }
+  return result;
+}
+
 static mlir::omp::LoopNestOp genLoopNestOp(
     lower::AbstractConverter &converter, lower::SymMap &symTable,
     semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
@@ -2912,8 +2953,18 @@ static mlir::omp::LoopNestOp genLoopNestOp(
         wrapperArgs,
     llvm::omp::Directive directive, DataSharingProcessor &dsp,
     llvm::function_ref<void(mlir::Operation *)> loopPostIvCb = nullptr) {
+  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+  // Copy the linear value into the private allocatable at iteration start.
+  llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> linearCopies;
   auto ivCallback = [&](mlir::Operation *op) {
     genLoopVars(op, converter, loc, iv, wrapperArgs);
+    for (auto [sym, linearVar] : getLinearAllocatables(wrapperArgs)) {
+      mlir::Value privAddr = converter.getSymbolAddress(*sym);
+      mlir::Value val = fir::LoadOp::create(firOpBuilder, loc, linearVar);
+      hlfir::AssignOp::create(firOpBuilder, loc, val, privAddr,
+                              /*realloc=*/true);
+      linearCopies.emplace_back(privAddr, linearVar);
+    }
     if (loopPostIvCb)
       loopPostIvCb(op);
     return llvm::SmallVector<const semantics::Symbol *>(iv);
@@ -2922,7 +2973,7 @@ static mlir::omp::LoopNestOp genLoopNestOp(
   uint64_t nestValue = getCollapseValue(item->clauses);
   nestValue = nestValue < iv.size() ? iv.size() : nestValue;
   auto *nestedEval = getCollapsedLoopEval(eval, nestValue);
-  return genOpWithBody<mlir::omp::LoopNestOp>(
+  auto loopNestOp = genOpWithBody<mlir::omp::LoopNestOp>(
       OpWithBodyGenInfo(converter, symTable, semaCtx, loc, *nestedEval,
                         directive)
           .setClauses(&item->clauses)
@@ -2930,6 +2981,21 @@ static mlir::omp::LoopNestOp genLoopNestOp(
           .setGenRegionEntryCb(ivCallback)
           .setCollapseInfo(nestValue, eval),
       queue, item, clauseOps);
+
+  // Copy the private value back to the linear value before the yield.
+  if (!linearCopies.empty()) {
+    mlir::OpBuilder::InsertionGuard guard(firOpBuilder);
+    for (mlir::Block &block : loopNestOp.getRegion())
+      if (auto yield = mlir::dyn_cast<mlir::omp::YieldOp>(&block.back()))
+        firOpBuilder.setInsertionPoint(yield);
+    for (auto [privAddr, linearVar] : linearCopies) {
+      hlfir::Entity priv = hlfir::derefPointersAndAllocatables(
+          loc, firOpBuilder, hlfir::Entity{privAddr});
+      mlir::Value val = hlfir::loadTrivialScalar(loc, firOpBuilder, priv);
+      fir::StoreOp::create(firOpBuilder, loc, val, linearVar);
+    }
+  }
+  return loopNestOp;
 }
 
 static mlir::omp::LoopOp
